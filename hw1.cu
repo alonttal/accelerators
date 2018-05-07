@@ -1,5 +1,5 @@
 /* compile with: nvcc -O3 hw1.cu -o hw1 */
-
+// Itay - Verifying commit privileges
 #include <stdio.h>
 // #include <sys/time.h>
 
