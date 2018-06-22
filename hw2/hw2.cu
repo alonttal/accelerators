@@ -73,20 +73,20 @@ struct cpu_gpu_queue {
     // and the functions are not defined properly.
     // i.e. We need to do this:
     // alloc -> new struct -> memcpy from struct to alloc
-    int tail = 0;
-    int head = 0;
+    int tail;
+    int head;
     int q[QUEUE_SLOTS * REQUEST_SIZE_BYTES]; // Slot size is different in cpu_gpu and gpu_cpu since request is larger than response
 
     produce(int* item) {
         if (head < size) {
-            memcpy(&q[head * REQUEST_SIZE_BYTES], item, REQUEST_SIZE_BYTES);
+            CUDA_CHECK( cudaMemcpy(&q[head * REQUEST_SIZE_BYTES], item, REQUEST_SIZE_BYTES, cudaMemcpyHostToHost) );
             head++;
         }
     }
     
     consume(int* item) {
         if (tail < head) {
-            memcpy(item, &q[tail * REQUEST_SIZE_BYTES], REQUEST_SIZE_BYTES);
+            CUDA_CHECK( cudaMemcpy(item, &q[tail * REQUEST_SIZE_BYTES], REQUEST_SIZE_BYTES, cudaMemcpyDeviceToDevice) );
             tail++;
             __threadfence();
         }
@@ -98,13 +98,13 @@ struct gpu_cpu_queue {
     // and the functions are not defined properly.
     // i.e. We need to do this:
     // alloc -> new struct -> memcpy from struct to alloc
-    int tail = 0;
-    int head = 0;
+    int tail;
+    int head;
     int q[QUEUE_SLOTS * RESPONSE_SIZE_BYTES]; // Slot size is different in cpu_gpu and gpu_cpu since request is larger than response
 
     produce(uchar* item) {
         if (head < size) {
-            memcpy(&q[head * RESPONSE_SIZE_BYTES], item, RESPONSE_SIZE_BYTES);
+            CUDA_CHECK( cudaMemcpy(&q[head * REQUEST_SIZE_BYTES], item, REQUEST_SIZE_BYTES, cudaMemcpyDeviceToDevice) );
             __threadfence();
             head++;
         }
@@ -112,7 +112,7 @@ struct gpu_cpu_queue {
     
     consume(uchar* item) {
         if (tail < head) {
-            memcpy(item, &q[tail * RESPONSE_SIZE_BYTES], RESPONSE_SIZE_BYTES);
+            CUDA_CHECK( cudaMemcpy(item, &q[tail * REQUEST_SIZE_BYTES], REQUEST_SIZE_BYTES, cudaMemcpyHostToHost) );
             tail++;
         }
     }
@@ -475,13 +475,24 @@ struct queue_interface create_queue_interface() {
 
     (struct cpu_gpu_queue)* gpu_producer_arr[THREADBLOCKS]; // i.e. for gpu to pass responses
     (struct cpu_gpu_queue)* gpu_consumer_arr[THREADBLOCKS]; // i.e. for gpu to get requests
-    
+
+    struct cpu_gpu_queue tmp_producer;
+    tmp_producer.head = 0;
+    tmp_producer.tail = 0;
+
+    struct gpu_cpu_queue tmp_consumer;
+    tmp_consumer.head = 0;
+    tmp_consumer.tail = 0;
+
     for (int i = 0; i < THREADBLOCKS; i++) {
         CUDA_CHECK( cudaHostAlloc(&cpu_producer_arr[i], sizeof(struct cpu_gpu_queue), 0) );
         CUDA_CHECK( cudaHostAlloc(&cpu_consumer_arr[i], sizeof(struct gpu_cpu_queue), 0) );
 
         CUDA_CHECK( cudaHostGetDevicePointer(&gpu_producer_arr[i], cpu_consumer_arr[i], 0) );
         CUDA_CHECK( cudaHostGetDevicePointer(&gpu_consumer_arr[i], cpu_producer_arr[i], 0) );
+
+        CUDA_CHECK( cudaMemcpy(cpu_producer_arr[i], &tmp_producer, sizeof(struct cpu_gpu_queue), cudaMemcpyHostToHost) );
+        CUDA_CHECK( cudaMemcpy(cpu_consumer_arr[i], &tmp_consumer, sizeof(struct gpu_cpu_queue), cudaMemcpyHostToHost) );
     }
 
     struct queue_interface _queue_interface;
