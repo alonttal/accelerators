@@ -28,7 +28,10 @@
 #define HISTSIZE        256
 #define REGS_PER_THREAD 32
 #define QUEUE_SLOTS     10
-#define THREADBLOCKS    TODO:
+
+#define THREADBLOCKS        TODO:
+#define REQUEST_SIZE_BYTES  TODO:
+#define RESPONSE_SIZE_BYTES TODO:
 
 
 #define SQR(a) ((a) * (a))
@@ -78,16 +81,23 @@ struct cpu_gpu_queue {
     int q[QUEUE_SLOTS * REQUEST_SIZE_BYTES]; // Slot size is different in cpu_gpu and gpu_cpu since request is larger than response
 
     produce(int* item) {
-        if (head < size) {
+        // Condition:
+        // Say the queue size is 10, tail and head initialized to 0
+        // since the counting is done in a cyclic way, at some point tail can be 9 and head 1
+        // this means there are two slots in use.
+        // We cannot produce anymore when tail is larger than head in exactly 1
+        // e.g. tail = 5, head = 4
+        // This means all 10 slots are in use
+        if (tail - head != 1) { 
             CUDA_CHECK( cudaMemcpy(&q[head * REQUEST_SIZE_BYTES], item, REQUEST_SIZE_BYTES, cudaMemcpyHostToHost) );
-            head++;
+            head = (head + 1) % QUEUE_SLOTS;
         }
     }
     
     consume(int* item) {
-        if (tail < head) {
+        if (tail != head) {
             CUDA_CHECK( cudaMemcpy(item, &q[tail * REQUEST_SIZE_BYTES], REQUEST_SIZE_BYTES, cudaMemcpyDeviceToDevice) );
-            tail++;
+            tail = (tail + 1) % QUEUE_SLOTS;
             __threadfence();
         }
     }
@@ -103,17 +113,17 @@ struct gpu_cpu_queue {
     int q[QUEUE_SLOTS * RESPONSE_SIZE_BYTES]; // Slot size is different in cpu_gpu and gpu_cpu since request is larger than response
 
     produce(uchar* item) {
-        if (head < size) {
+        if (tail - head != 1) {
             CUDA_CHECK( cudaMemcpy(&q[head * REQUEST_SIZE_BYTES], item, REQUEST_SIZE_BYTES, cudaMemcpyDeviceToDevice) );
             __threadfence();
-            head++;
+            head = (head + 1) % QUEUE_SLOTS;
         }
     }
     
     consume(uchar* item) {
-        if (tail < head) {
+        if (tail != head) {
             CUDA_CHECK( cudaMemcpy(item, &q[tail * REQUEST_SIZE_BYTES], REQUEST_SIZE_BYTES, cudaMemcpyHostToHost) );
-            tail++;
+            tail = (tail + 1) % QUEUE_SLOTS;
         }
     }
 }
@@ -471,9 +481,9 @@ int get_max_threadblocks(int t_per_tb) {
 
 struct queue_interface create_queue_interface() {
     (struct cpu_gpu_queue)* cpu_producer_arr[THREADBLOCKS]; // i.e. for cpu to pass requests
-    (struct cpu_gpu_queue)* cpu_consumer_arr[THREADBLOCKS]; // i.e. for cpu to get responses
+    (struct gpu_cpu_queue)* cpu_consumer_arr[THREADBLOCKS]; // i.e. for cpu to get responses
 
-    (struct cpu_gpu_queue)* gpu_producer_arr[THREADBLOCKS]; // i.e. for gpu to pass responses
+    (struct gpu_cpu_queue)* gpu_producer_arr[THREADBLOCKS]; // i.e. for gpu to pass responses
     (struct cpu_gpu_queue)* gpu_consumer_arr[THREADBLOCKS]; // i.e. for gpu to get requests
 
     struct cpu_gpu_queue tmp_producer;
