@@ -26,7 +26,10 @@
 #define NREQUESTS       100000
 #define NSTREAMS        64
 #define HISTSIZE        256
-#define REGS_PER_THREAD  32
+#define REGS_PER_THREAD 32
+#define QUEUE_SLOTS     10
+#define THREADBLOCKS    TODO:
+
 
 #define SQR(a) ((a) * (a))
 #define CUDA_CHECK(f) do {                                                                  \
@@ -39,15 +42,15 @@
 
 typedef unsigned char uchar;
 
-
-
+// We can use the if(n)def to switch easily between win/unix by simply commenting the define code-line
+#ifndef WINDOWS
 // unix version
-// double static inline get_time_msec(void) {
-//     struct timeval t;
-//     gettimeofday(&t, NULL);
-//     return t.tv_sec * 1e+3 + t.tv_usec * 1e-3;
-// }
-
+double static inline get_time_msec(void) {
+    struct timeval t;
+    gettimeofday(&t, NULL);
+    return t.tv_sec * 1e+3 + t.tv_usec * 1e-3;
+}
+#else
 // windows version
 double static inline get_time_msec(void) {
     SYSTEMTIME time;
@@ -55,7 +58,7 @@ double static inline get_time_msec(void) {
     LONG time_ms = (time.wSecond * 1000) + time.wMilliseconds;
     return time_ms;
 }
-
+#endif
 
 /* we'll use these to rate limit the request load */
 struct rate_limit_t {
@@ -63,6 +66,64 @@ struct rate_limit_t {
     double lambda;
     unsigned seed;
 };
+
+// We could have done it more generic, i.e. 'one queue fits all' style, but it would require multiple 'cudaHostAlloc's etc.
+struct cpu_gpu_queue {
+    // We need to pay attention that if we use 'cudaHostAlloc' for the struct's size, the tail and head aren't initialized to 0,
+    // and the functions are not defined properly.
+    // i.e. We need to do this:
+    // alloc -> new struct -> memcpy from struct to alloc
+    int tail = 0;
+    int head = 0;
+    int q[QUEUE_SLOTS * REQUEST_SIZE_BYTES]; // Slot size is different in cpu_gpu and gpu_cpu since request is larger than response
+
+    produce(int* item) {
+        if (head < size) {
+            memcpy(&q[head * REQUEST_SIZE_BYTES], item, REQUEST_SIZE_BYTES);
+            head++;
+        }
+    }
+    
+    consume(int* item) {
+        if (tail < head) {
+            memcpy(item, &q[tail * REQUEST_SIZE_BYTES], REQUEST_SIZE_BYTES);
+            tail++;
+            __threadfence();
+        }
+    }
+}
+
+struct gpu_cpu_queue {
+    // We need to pay attention that if we use 'cudaHostAlloc' for the struct's size, the tail and head aren't initialized to 0,
+    // and the functions are not defined properly.
+    // i.e. We need to do this:
+    // alloc -> new struct -> memcpy from struct to alloc
+    int tail = 0;
+    int head = 0;
+    int q[QUEUE_SLOTS * RESPONSE_SIZE_BYTES]; // Slot size is different in cpu_gpu and gpu_cpu since request is larger than response
+
+    produce(uchar* item) {
+        if (head < size) {
+            memcpy(&q[head * RESPONSE_SIZE_BYTES], item, RESPONSE_SIZE_BYTES);
+            __threadfence();
+            head++;
+        }
+    }
+    
+    consume(uchar* item) {
+        if (tail < head) {
+            memcpy(item, &q[tail * RESPONSE_SIZE_BYTES], RESPONSE_SIZE_BYTES);
+            tail++;
+        }
+    }
+}
+
+struct queue_interface {
+    (struct cpu_gpu_queue)** cpu_producer_arr;
+    (struct cpu_gpu_queue)** cpu_consumer_arr;
+    (struct cpu_gpu_queue)** gpu_producer_arr;
+    (struct cpu_gpu_queue)** gpu_consumer_arr;
+}
 
 void rate_limit_init(struct rate_limit_t *rate_limit, double lambda, int seed) {
     rate_limit->lambda = lambda;
@@ -405,6 +466,43 @@ int get_max_threadblocks(int t_per_tb) {
     printf("Registers per block: %d\n", prop.regsPerBlock);
 
     return max_tb_by_regs > max_tb_by_sharedMem ? (max_tb_by_regs > max_tb_by_threads ? max_tb_by_regs : max_tb_by_threads) : (max_tb_by_sharedMem > max_tb_by_threads ? max_tb_by_sharedMem : max_tb_by_threads);
+}
+
+
+struct queue_interface create_queue_interface() {
+    (struct cpu_gpu_queue)* cpu_producer_arr[THREADBLOCKS]; // i.e. for cpu to pass requests
+    (struct cpu_gpu_queue)* cpu_consumer_arr[THREADBLOCKS]; // i.e. for cpu to get responses
+
+    (struct cpu_gpu_queue)* gpu_producer_arr[THREADBLOCKS]; // i.e. for gpu to pass responses
+    (struct cpu_gpu_queue)* gpu_consumer_arr[THREADBLOCKS]; // i.e. for gpu to get requests
+    
+    for (int i = 0; i < THREADBLOCKS; i++) {
+        CUDA_CHECK( cudaHostAlloc(&cpu_producer_arr[i], sizeof(struct cpu_gpu_queue), 0) );
+        CUDA_CHECK( cudaHostAlloc(&cpu_consumer_arr[i], sizeof(struct gpu_cpu_queue), 0) );
+
+        CUDA_CHECK( cudaHostGetDevicePointer(&gpu_producer_arr[i], cpu_consumer_arr[i], 0) );
+        CUDA_CHECK( cudaHostGetDevicePointer(&gpu_consumer_arr[i], cpu_producer_arr[i], 0) );
+    }
+
+    struct queue_interface _queue_interface;
+
+    _queue_interface.cpu_producer_arr = cpu_producer_arr;
+    _queue_interface.cpu_consumer_arr = cpu_consumer_arr;
+    _queue_interface.gpu_producer_arr = gpu_producer_arr;
+    _queue_interface.gpu_consumer_arr = gpu_consumer_arr;
+
+
+    // Summary:
+    // This function returns the interface for both the cpu and gpu to access the queues.
+    // cpu_producer_arr contains the corresponding host pointers for the gpu_consumer_arr device pointers (pointers to queues)
+    // cpu_consumer_arr contains the corresponding host pointers for the gpu_producer_arr device pointers (pointers to queues)
+
+    // Usage:
+    // Send kernel gpu_consumer_arr
+    // Send requests to threadblock i using cpu_producer_arr[i]->produce(host_mem)
+    // Each threadblock gets requests using gpu_consumer_arr[blockIdx.x]->consume(device_mem)
+    // Response sent using opposite queues (producer <-> consumer)
+
 }
 
 int main(int argc, char *argv[]) {
