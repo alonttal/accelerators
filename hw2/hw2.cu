@@ -1,5 +1,5 @@
 /* compile with: nvcc -O3 -maxrregcount=32 hw2.cu -o hw2 */
-#define WINDOWS
+//#define WINDOWS
 
 #ifdef WINDOWS
     #define _CRT_RAND_S
@@ -12,6 +12,7 @@
     #include <unistd.h>
     #define RANDOM rand_r
     #define SLEEP usleep
+    #define UNIX_TIME
 #endif  
 
 
@@ -23,16 +24,11 @@
 
 #define IMG_DIMENSION   32
 #define N_IMG_PAIRS     10000
-#define NREQUESTS       100000
+#define NREQUESTS       10000
 #define NSTREAMS        64
 #define HISTSIZE        256
 #define REGS_PER_THREAD 32
-#define QUEUE_SLOTS     10
-
-#define THREADBLOCKS        TODO:
-#define REQUEST_SIZE_BYTES  TODO:
-#define RESPONSE_SIZE_BYTES TODO:
-
+#define QUEUE_SIZE      10
 
 #define SQR(a) ((a) * (a))
 #define CUDA_CHECK(f) do {                                                                  \
@@ -42,12 +38,20 @@
         exit(1);                                                                            \
     }                                                                                       \
 } while (0)
+#define GPU_GLOBAL_FENCE(a) do { \
+    __threadfence_system();      \
+    a;                           \
+    __threadfence_system();      \
+} while(0)
 
-typedef unsigned char uchar;
+#define SYNCED_WRITE(a) do { \
+    __sync_synchronize();    \
+    a;                       \
+    __sync_synchronize();    \
+} while(0)
 
-// We can use the if(n)def to switch easily between win/unix by simply commenting the define code-line
-#ifndef WINDOWS
-// unix version
+#ifdef UNIX_TIME
+//unix version
 double static inline get_time_msec(void) {
     struct timeval t;
     gettimeofday(&t, NULL);
@@ -63,77 +67,14 @@ double static inline get_time_msec(void) {
 }
 #endif
 
+typedef unsigned char uchar;
+
 /* we'll use these to rate limit the request load */
 struct rate_limit_t {
     double last_checked;
     double lambda;
     unsigned seed;
 };
-
-// We could have done it more generic, i.e. 'one queue fits all' style, but it would require multiple 'cudaHostAlloc's etc.
-struct cpu_gpu_queue {
-    // We need to pay attention that if we use 'cudaHostAlloc' for the struct's size, the tail and head aren't initialized to 0,
-    // and the functions are not defined properly.
-    // i.e. We need to do this:
-    // alloc -> new struct -> memcpy from struct to alloc
-    int tail;
-    int head;
-    int q[QUEUE_SLOTS * REQUEST_SIZE_BYTES]; // Slot size is different in cpu_gpu and gpu_cpu since request is larger than response
-
-    produce(int* item) {
-        // Condition:
-        // Say the queue size is 10, tail and head initialized to 0
-        // since the counting is done in a cyclic way, at some point tail can be 9 and head 1
-        // this means there are two slots in use.
-        // We cannot produce anymore when tail is larger than head in exactly 1
-        // e.g. tail = 5, head = 4
-        // This means all 10 slots are in use
-        if (tail - head != 1) { 
-            CUDA_CHECK( cudaMemcpy(&q[head * REQUEST_SIZE_BYTES], item, REQUEST_SIZE_BYTES, cudaMemcpyHostToHost) );
-            head = (head + 1) % QUEUE_SLOTS;
-        }
-    }
-    
-    consume(int* item) {
-        if (tail != head) {
-            CUDA_CHECK( cudaMemcpy(item, &q[tail * REQUEST_SIZE_BYTES], REQUEST_SIZE_BYTES, cudaMemcpyDeviceToDevice) );
-            tail = (tail + 1) % QUEUE_SLOTS;
-            __threadfence();
-        }
-    }
-}
-
-struct gpu_cpu_queue {
-    // We need to pay attention that if we use 'cudaHostAlloc' for the struct's size, the tail and head aren't initialized to 0,
-    // and the functions are not defined properly.
-    // i.e. We need to do this:
-    // alloc -> new struct -> memcpy from struct to alloc
-    int tail;
-    int head;
-    int q[QUEUE_SLOTS * RESPONSE_SIZE_BYTES]; // Slot size is different in cpu_gpu and gpu_cpu since request is larger than response
-
-    produce(uchar* item) {
-        if (tail - head != 1) {
-            CUDA_CHECK( cudaMemcpy(&q[head * REQUEST_SIZE_BYTES], item, REQUEST_SIZE_BYTES, cudaMemcpyDeviceToDevice) );
-            __threadfence();
-            head = (head + 1) % QUEUE_SLOTS;
-        }
-    }
-    
-    consume(uchar* item) {
-        if (tail != head) {
-            CUDA_CHECK( cudaMemcpy(item, &q[tail * REQUEST_SIZE_BYTES], REQUEST_SIZE_BYTES, cudaMemcpyHostToHost) );
-            tail = (tail + 1) % QUEUE_SLOTS;
-        }
-    }
-}
-
-struct queue_interface {
-    (struct cpu_gpu_queue)** cpu_producer_arr;
-    (struct cpu_gpu_queue)** cpu_consumer_arr;
-    (struct cpu_gpu_queue)** gpu_producer_arr;
-    (struct cpu_gpu_queue)** gpu_consumer_arr;
-}
 
 void rate_limit_init(struct rate_limit_t *rate_limit, double lambda, int seed) {
     rate_limit->lambda = lambda;
@@ -154,8 +95,6 @@ int rate_limit_can_send(struct rate_limit_t *rate_limit) {
 
 void rate_limit_wait(struct rate_limit_t *rate_limit) {
     while (!rate_limit_can_send(rate_limit)) {
-
-        printf("%lf\n", (1. / (rate_limit->lambda * 1e-6) * 0.01));
         SLEEP(1. / (rate_limit->lambda * 1e-6) * 0.01);
     }
 }
@@ -205,6 +144,8 @@ double histogram_distance(int *h1, int *h2) {
             distance += ((double)SQR(h1[i] - h2[i])) / (h1[i] + h2[i]);
         }
     }
+    // printf("%lf ", distance);
+
     return distance;
 }
 
@@ -241,43 +182,90 @@ void print_usage_and_die(char *progname) {
     exit(1);
 }
 
+// enum for specifying current mode (Streams / Queue)
+enum {PROGRAM_MODE_STREAMS = 0, PROGRAM_MODE_QUEUE};
+
+// struct to save all the command line arguments
+// mode                 - the mode of the program (Streams / Queue)
+// threads_queue_mode   - is only used for Queue mode and specified the number of threads on a threadblock
+// load                 - used to setup the time between each client's request (not working well in windows OS 
+//                        only Linux OS due to Windows limitations!!!)
 struct cmd_line_args {
     int mode;
     int threads_queue_mode;
     double load;
 };
+
+// struct for saving start and end time of job executions
 struct times {
     double t_start;
     double t_finish;
 };
+
+// this struct is used for the Stream mode
+// nreq - the task number that is currently bring handled
+// distance- the calculated distance of 2 histograms. This is the taks's result
+// stream - cuda streaming channel
 struct request {
     int nreq;
-    cudaStream_t stream;
     double distance;
+    cudaStream_t stream;
 };
-enum {PROGRAM_MODE_STREAMS = 0, PROGRAM_MODE_QUEUE};
+
+// producer queue slot (element) holds 2 images to we want to consume
+struct producer_queue_slot {
+    volatile int req_num;
+    volatile int x;
+};
+
+// producer queue with the current producer position and current consumer position
+struct producer_queue {
+    struct producer_queue_slot slots[QUEUE_SIZE];
+    volatile int i_producer;
+    volatile int i_consumer;
+};
+
+// consumer queue slot (element) holds a distance calculation result
+struct consumer_queue_slot {
+    volatile int req_num;
+    volatile double x;
+};
+
+// consumer queue with with the current producer position and current consumer position
+struct consumer_queue {
+    struct consumer_queue_slot slots[QUEUE_SIZE];
+    volatile int i_producer;
+    volatile int i_consumer;
+};
 
 // read command line parameters
-// if parameters are invalid the process might be killed.
+// if parameters are invalid the process is killed.
 struct cmd_line_args read_cmd_params(int argc, char *argv[]) {
     struct cmd_line_args args = {
-        -1, /* mode */
-        -1, /* threads_queue_mode */
-        0   /* load */
+        -1, // mode
+        -1, // threads_queue_mode
+         0  // load
     };
 
+    // if there are not enough arguments - fail
     if (argc < 3) print_usage_and_die(argv[0]);
-
+    // if current mode is Stream, check that there are enough arguments (should be 3),
+    // and save user's selected parameters
     if (!strcmp(argv[1], "streams")) {
         if (argc != 3) print_usage_and_die(argv[0]);
         args.mode = PROGRAM_MODE_STREAMS;
         args.load = atof(argv[2]);
-    } else if (!strcmp(argv[1], "queue")) {
+    } 
+    // if current mode is Quueue, check that there are enough arguments (should be 4),
+    // and save user's selected parameters
+    else if (!strcmp(argv[1], "queue")) {
         if (argc != 4) print_usage_and_die(argv[0]);
         args.mode = PROGRAM_MODE_QUEUE;
         args.threads_queue_mode = atoi(argv[2]);
         args.load = atof(argv[3]);
-    } else {
+    } 
+    // any other case must be an error - so fail.
+    else {
         print_usage_and_die(argv[0]);
     }
 
@@ -285,11 +273,12 @@ struct cmd_line_args read_cmd_params(int argc, char *argv[]) {
 }
 
 // cpu version for calculating the total distance between all images
+// nothing very interesting here.
 int h_calc_distance(uchar *images1, uchar *images2, struct times *time) {
-    double total_distance;
-
+    double total_distance = 0;
     int histogram1[HISTSIZE];
     int histogram2[HISTSIZE];
+
     time->t_start  = get_time_msec();
     for (int i = 0; i < NREQUESTS; i++) {
         int img_idx = i % N_IMG_PAIRS;
@@ -303,6 +292,7 @@ int h_calc_distance(uchar *images1, uchar *images2, struct times *time) {
 }
 
 // gpu version for calculating the total distance between all images
+// nothing very interesting here.
 int d_calc_distance(uchar *images1, uchar *images2, struct times *time) {
     uchar *gpu_image1, *gpu_image2;
     int *gpu_hist1, *gpu_hist2;
@@ -342,28 +332,41 @@ int d_calc_distance(uchar *images1, uchar *images2, struct times *time) {
     return total_distance;
 }
 
+// function for initiating array of structs of type request
 void init_requests(struct request* requests, int nrequests) {
+    // for every request in the array - initiate the cudaStream
+    // the 2 other assigns are redundant but it doesn't hurt to set them to zero
     for (int i = 0; i < nrequests; i++) {
         CUDA_CHECK( cudaStreamCreate(&requests[i].stream) );
         requests[i].distance = 0;
         requests[i].nreq = 0;
     }
 }
-
+// function for destroying array of structs of type request
 void destroy_requests(struct request* requests, int nrequests) {
+    // for every request in the array - free the memory of the cudaStream
     for (int i = 0; i < nrequests; i++) {
         CUDA_CHECK( cudaStreamDestroy(requests[i].stream) );
     }
 }
 
+// Streams version for calculating the total distance between all images
 int stream_calc_distance(uchar *images1, uchar *images2, double load, struct times *time) {
+    // array of gpu images where every element belog to a different Stream (used by the gpu)
     uchar *gpu_image1, *gpu_image2;
+    // array of gpu histograms where every element belog to a different Stream (used by the gpu)
     int *gpu_hist1, *gpu_hist2;
+    // array gpu distance calculation where every element belong to a different Stream (used by the gpu)
     double *gpu_hist_distance;
+    // this variable indicates the rate which data will be sent to the gpu
     struct rate_limit_t rate_limit;
+    // every stream sent task will recorded here, as well as the stream's result
     struct request requests[NSTREAMS];
+    // just a variable to save the current request that is going to be sent to the gpu
     struct request *request;
+    // a summer to sum up all calculated distances. at the end, it will hold the desired result
     double total_distance = 0;
+    // holds which stream is free to recieve a new task
     int idle;
 
     // init request struct array which conatains the streams
@@ -413,7 +416,6 @@ int stream_calc_distance(uchar *images1, uchar *images2, double load, struct tim
         // save the request number so we later know the position in the time array to save the end time.
         request->nreq = i;
         int img_idx = i % N_IMG_PAIRS;
-
         // before running the kernels in the idle stream, lets make some references so it will be easier to read everything later
         uchar *p_image1 = &images1[img_idx * IMG_DIMENSION * IMG_DIMENSION];
         uchar *p_image2 = &images2[img_idx * IMG_DIMENSION * IMG_DIMENSION];
@@ -450,84 +452,265 @@ int stream_calc_distance(uchar *images1, uchar *images2, double load, struct tim
     CUDA_CHECK( cudaFree(gpu_hist2) );
     CUDA_CHECK( cudaFree(gpu_hist_distance) );
     destroy_requests(requests, NSTREAMS);
-    printf("done\n");
 
     return total_distance;
 }
 
+// get the number of parallel thread blocks that can cocurrently run on the machine.
+// this function considers 3 gpu limitations:
+// 1. registers limitation - we know that every thread is going to use exactly 32 registers (as specified in the 
+// compilation command). Then, we need to take the number registers in each SM and divide it by the number of register
+// each thread uses to get the number of threads that can run on that SM. Divide the result by the number of threads
+// defined in the command line arguments to get the number of threadblocks which can run on that SM. lastly, multiply
+// by the number of SM in the device to get the total number of threadblocks.
+// 2. Shared memory - we are going to use shared memory in this section to share the memory of the histogram and distances
+// calculations. Dues we want to make sure we are not acceding the total usage of shared memory. we take the total shared
+// memory a SM possess and divide it by the shared memory we are going to use (in bytes). afterwards we multiply it by the
+// number of SMs.
+// 3. Threads boundary - we might be bounded by the nubmer of threads each SM can run. We take the total number of threads
+// an SM can run and divide it by the number of threads in each threadblock to get the number of threadblocks that can run simultaneously on an SM. after that multiply by the number of SM to get total number of threadblocks that can run together.
 int get_max_threadblocks(int t_per_tb) {
-    // int nDevices;
-    // cudaGetDeviceCount(&nDevices);
-    // printf("%d\n", nDevices);
     int nDevice = 0;
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, nDevice);
 
-    int max_tb_by_regs = (prop.regsPerMultiprocessor * prop.multiProcessorCount) / (t_per_tb * REGS_PER_THREAD);
-    int max_tb_by_sharedMem = (prop.sharedMemPerMultiprocessor * prop.multiProcessorCount) / (256); // TODO: change to sharedMem size
-    int max_tb_by_threads = (prop.maxThreadsPerMultiProcessor * prop.multiProcessorCount) / (t_per_tb);
-    // TODO: DELETE prinfs
-    printf("Device name: %s\n", prop.name);
-    printf("Threads per threadblock: %d\n", t_per_tb);
-    printf("#SMs: %d\n", prop.multiProcessorCount);
-    printf("Max threads per SM: %d\n", prop.maxThreadsPerMultiProcessor);
-    printf("Shared memory per SM: %zu\n", prop.sharedMemPerMultiprocessor);
-    printf("Registers per SM: %d\n", prop.regsPerMultiprocessor);
-    printf("Registers per block: %d\n", prop.regsPerBlock);
+    // total threadblocks number might be blocked by the number of register each thread uses.
+    int max_tb_by_regs = (prop.regsPerMultiprocessor / (t_per_tb * REGS_PER_THREAD)) * prop.multiProcessorCount;
+    // total threadblocks number might be blocked by the number of shared memory each threadblock uses.
+    int max_tb_by_sharedMem = (prop.sharedMemPerMultiprocessor / (2 * HISTSIZE * sizeof(int) + HISTSIZE * sizeof(double))) *prop.multiProcessorCount;
+    // total threadblocks number might be blocked by the number of concurrent running threads. 
+    int max_tb_by_threads = (prop.maxThreadsPerMultiProcessor / t_per_tb) * prop.multiProcessorCount;
 
-    return max_tb_by_regs > max_tb_by_sharedMem ? (max_tb_by_regs > max_tb_by_threads ? max_tb_by_regs : max_tb_by_threads) : (max_tb_by_sharedMem > max_tb_by_threads ? max_tb_by_sharedMem : max_tb_by_threads);
+    // the max total threads is the minimum between all theses 3 arguments (min-max condition)
+    return max_tb_by_regs < max_tb_by_sharedMem ? (max_tb_by_regs < max_tb_by_threads ? max_tb_by_regs : max_tb_by_threads) : (max_tb_by_sharedMem < max_tb_by_threads ? max_tb_by_sharedMem : max_tb_by_threads);
 }
 
+// see if there are pending tasks that need to be taken care
+__device__ void has_pending_tasks(volatile struct producer_queue *queue, bool *res) {
+    // pretending that I am the consumer - looking at the queue
+    // if the producer position is bigger than my position it means that he has placed a task for me
+    *res = queue->i_producer > queue->i_consumer;
+}
 
-struct queue_interface create_queue_interface() {
-    (struct cpu_gpu_queue)* cpu_producer_arr[THREADBLOCKS]; // i.e. for cpu to pass requests
-    (struct gpu_cpu_queue)* cpu_consumer_arr[THREADBLOCKS]; // i.e. for cpu to get responses
+// init histogram with zeros
+__device__ void initHistogram(int *hist) {
+    int tid = threadIdx.x;
+    int nThreads = blockDim.x;
 
-    (struct gpu_cpu_queue)* gpu_producer_arr[THREADBLOCKS]; // i.e. for gpu to pass responses
-    (struct cpu_gpu_queue)* gpu_consumer_arr[THREADBLOCKS]; // i.e. for gpu to get requests
+    for (int i = tid; i < HISTSIZE; i += nThreads) {
+        hist[i] = 0;
+    }
+}
 
-    struct cpu_gpu_queue tmp_producer;
-    tmp_producer.head = 0;
-    tmp_producer.tail = 0;
+// convert an image to hsitogram (# of threads can be any #)
+__device__ void im2hist(uchar *image, int *histogram) {
+    int tid = threadIdx.x;
+    int nThreads = blockDim.x;
 
-    struct gpu_cpu_queue tmp_consumer;
-    tmp_consumer.head = 0;
-    tmp_consumer.tail = 0;
+    initHistogram(histogram);
+    __syncthreads();
+    
+    for(int i = tid ; i < IMG_DIMENSION * IMG_DIMENSION; i += nThreads) {
+        uchar pattern = local_binary_pattern(image, i / IMG_DIMENSION, i % IMG_DIMENSION);
+        atomicAdd(&histogram[pattern], 1);
+    }
+}
 
-    for (int i = 0; i < THREADBLOCKS; i++) {
-        CUDA_CHECK( cudaHostAlloc(&cpu_producer_arr[i], sizeof(struct cpu_gpu_queue), 0) );
-        CUDA_CHECK( cudaHostAlloc(&cpu_consumer_arr[i], sizeof(struct gpu_cpu_queue), 0) );
+// calculate distance between 2 histograms (# of threads can be any #)
+__device__ void hists2dist(int *h1, int *h2, double *distance) {
+    int tid = threadIdx.x;
+    int nThreads = blockDim.x;
 
-        CUDA_CHECK( cudaHostGetDevicePointer(&gpu_producer_arr[i], cpu_consumer_arr[i], 0) );
-        CUDA_CHECK( cudaHostGetDevicePointer(&gpu_consumer_arr[i], cpu_producer_arr[i], 0) );
+    for (int i = tid; i < HISTSIZE ; i += nThreads) {
+        double sum = h1[i] + h2[i];
+        distance[i] = (sum != 0) ? ((double)SQR(h1[i] - h2[i])) / sum : 0;
+    }
+    
+    int half_length = HISTSIZE / 2;
+    __syncthreads();
 
-        CUDA_CHECK( cudaMemcpy(cpu_producer_arr[i], &tmp_producer, sizeof(struct cpu_gpu_queue), cudaMemcpyHostToHost) );
-        CUDA_CHECK( cudaMemcpy(cpu_consumer_arr[i], &tmp_consumer, sizeof(struct gpu_cpu_queue), cudaMemcpyHostToHost) );
+	while (half_length >= 1) {
+		for (int i = tid; i < half_length; i += nThreads) {
+            distance[i] = distance[i] + distance[i + half_length];
+        }
+		half_length /= 2;
+		__syncthreads();
+    }
+}
+
+__global__ void gpu_consume(uchar* image1, uchar* image2, 
+                            volatile int *done,
+                            volatile struct producer_queue *pc_queue,
+                            volatile struct consumer_queue *cp_queue) {
+    int tid = threadIdx.x;
+    int bid = blockIdx.x;
+    //histograms must be shared between threads
+    __shared__ int histogram1[HISTSIZE]; 
+    __shared__ int histogram2[HISTSIZE];
+    __shared__ double distance[HISTSIZE];
+
+    while (true) {
+
+        if (tid == 0) {
+            while (pc_queue[bid].i_producer <= pc_queue[bid].i_consumer && !(*done)); // wait for new tasks
+        }
+
+        __syncthreads();
+
+        if(pc_queue[bid].i_producer <= pc_queue[bid].i_consumer && (*done)) {
+            break; // end
+        }
+
+        int img_idx = pc_queue[bid].slots[(pc_queue[bid].i_consumer) % QUEUE_SIZE].x;
+        int req_num = pc_queue[bid].slots[(pc_queue[bid].i_consumer) % QUEUE_SIZE].req_num;
+
+        __syncthreads();
+
+        if (tid == 0) {
+            GPU_GLOBAL_FENCE(pc_queue[bid].i_consumer++);
+        } 
+        
+        // calculate the images histograms
+        im2hist(&(image1[img_idx]), histogram1);
+        im2hist(&(image2[img_idx]), histogram2);
+        // wait for all thread to finish calculations
+        __syncthreads();
+        // calculate histograms distance
+        hists2dist(histogram1, histogram2, distance);
+        // wait for all thread to finish calculations
+        __syncthreads();
+        // let only the 0 thread update the producer
+        if (tid == 0) {
+            while (cp_queue[bid].i_consumer - cp_queue[bid].i_producer >= QUEUE_SIZE); // wait for space in queue
+            
+            GPU_GLOBAL_FENCE(cp_queue[bid].slots[(cp_queue[bid].i_consumer) % QUEUE_SIZE].req_num = req_num);
+            GPU_GLOBAL_FENCE(cp_queue[bid].slots[(cp_queue[bid].i_consumer) % QUEUE_SIZE].x = distance[0]);
+            GPU_GLOBAL_FENCE(cp_queue[bid].i_consumer++);
+        }
+        __syncthreads();
+    }
+}
+
+// return the sum of distances computed by a consumer
+double collect_completed_tasks_results(volatile struct consumer_queue *queue, struct times *time) {
+    double distance = 0;
+    // this value may change, so before we start lets save it
+    volatile int last_completed_task = queue->i_consumer;
+    // for every completed task copy the result and assign the end time
+    for(int i = queue->i_producer; i < last_completed_task; i++) {
+        distance += queue->slots[i % QUEUE_SIZE].x;
+        time[queue->slots[i % QUEUE_SIZE].req_num].t_finish = get_time_msec();
+    }
+    // increase the producer position by the number of the completed tasks gathered
+    SYNCED_WRITE(queue->i_producer = last_completed_task);
+
+    return distance;
+}
+
+void send_task(int task_num, int img_idx, volatile struct producer_queue *queue, struct times *time) {
+    // save the start time of the request
+    time[task_num].t_start = get_time_msec();
+    // calculate the slot in the producer queue the task should be placed in
+    int slot_index = (queue->i_producer) % QUEUE_SIZE;
+    // save the task number in its coresponding slot_index so we later know the index in time array to save the finish_time
+    SYNCED_WRITE(queue->slots[slot_index].req_num = task_num);
+    // copy the job to the comsumer
+    SYNCED_WRITE(queue->slots[slot_index].x = img_idx);
+    // now the consumer has all the data it needs to compute the distance between the 2 images. let him know there is a new task
+    // by increasing the i_producer variable.
+    SYNCED_WRITE(queue->i_producer = queue->i_producer + 1);
+}
+
+inline bool can_send_tasks(volatile struct producer_queue *pc_queue) {
+    // if the producer send-receive window is less than QUEUE_SIZE it means we will not override any other slot - i.e. we
+    // can send a new task to the consumer
+    return pc_queue->i_producer - pc_queue->i_consumer < QUEUE_SIZE;
+}
+
+inline bool has_completed_tasks(volatile struct consumer_queue *cp_queue) {
+    // if the position of the consumer is larger then the postion of the producer, then there are completed tasks
+    return cp_queue->i_producer < cp_queue->i_consumer;
+}
+
+// producer-consumer version for calculating the total distance between all images
+int producer_consumer_calc_distance(uchar *images1, uchar *images2, double load, struct times *time, int nConsumers, int t_per_tb) {
+    uchar *gpu_image1, *gpu_image2;
+    struct rate_limit_t rate_limit; // this variable indicates the rate which data will be sent to the gpu
+    volatile struct producer_queue *pc_queue, *gpu_pc_queue; // producer-consumer queue
+    volatile struct consumer_queue *cp_queue, *gpu_cp_queue; // consumer-producer queue
+    volatile int *done, *gpu_done; // flag that will indicate that there are no tasks left
+    double total_distance = 0;
+    int i_next_consumer = 0; // will save the next consumer to recieve a job
+    int left_requests = NREQUESTS; // will save the # of jobs left to handle
+
+    // init random variable that handles client requests simulations
+    rate_limit_init(&rate_limit, load, 0);
+    // init producer-consumer & consumer-producer queue
+    // share pointers of the queues between cpu and gpu
+    CUDA_CHECK( cudaHostAlloc(&done, sizeof(int), 0) );
+    CUDA_CHECK( cudaHostAlloc(&pc_queue, nConsumers * sizeof(struct producer_queue), 0) );
+    CUDA_CHECK( cudaHostAlloc(&cp_queue, nConsumers * sizeof(struct consumer_queue), 0) );
+    CUDA_CHECK( cudaHostGetDevicePointer((void**)&gpu_done, (void*)done, 0) );
+    CUDA_CHECK( cudaHostGetDevicePointer((void**)&gpu_pc_queue, (void*)pc_queue, 0) );
+    CUDA_CHECK( cudaHostGetDevicePointer((void**)&gpu_cp_queue, (void*)cp_queue, 0) );
+    // init gpu images
+    CUDA_CHECK( cudaMalloc(&gpu_image2, N_IMG_PAIRS * IMG_DIMENSION * IMG_DIMENSION * sizeof(uchar)) );
+    CUDA_CHECK( cudaMalloc(&gpu_image1, N_IMG_PAIRS * IMG_DIMENSION * IMG_DIMENSION * sizeof(uchar)) );
+    cudaMemcpy(gpu_image1, images1, N_IMG_PAIRS * IMG_DIMENSION * IMG_DIMENSION, cudaMemcpyHostToDevice);
+    cudaMemcpy(gpu_image2, images2, N_IMG_PAIRS * IMG_DIMENSION * IMG_DIMENSION, cudaMemcpyHostToDevice);
+
+    for (int i = 0; i < nConsumers ; i++) {
+        pc_queue[i].i_producer = 0;
+        pc_queue[i].i_consumer = 0;
+        cp_queue[i].i_producer = 0;
+        cp_queue[i].i_consumer = 0;
     }
 
-    struct queue_interface _queue_interface;
+    SYNCED_WRITE(*done = 0); // set the flag to done = false, so we indicate that there is still some work to be done
+    CUDA_CHECK( cudaDeviceSynchronize() ); // sync everything with the gpu before starting
 
-    _queue_interface.cpu_producer_arr = cpu_producer_arr;
-    _queue_interface.cpu_consumer_arr = cpu_consumer_arr;
-    _queue_interface.gpu_producer_arr = gpu_producer_arr;
-    _queue_interface.gpu_consumer_arr = gpu_consumer_arr;
+    gpu_consume<<<nConsumers, t_per_tb>>>(gpu_image1, gpu_image2, gpu_done, gpu_pc_queue, gpu_cp_queue);
 
+    while (left_requests > 0) {
+        if (has_completed_tasks( &(cp_queue[i_next_consumer]) )) { // collect completed tasks
+            total_distance += collect_completed_tasks_results(&(cp_queue[i_next_consumer]), time);
+        }
 
-    // Summary:
-    // This function returns the interface for both the cpu and gpu to access the queues.
-    // cpu_producer_arr contains the corresponding host pointers for the gpu_consumer_arr device pointers (pointers to queues)
-    // cpu_consumer_arr contains the corresponding host pointers for the gpu_producer_arr device pointers (pointers to queues)
+        rate_limit_wait(&rate_limit); // wait
 
-    // Usage:
-    // Send kernel gpu_consumer_arr
-    // Send requests to threadblock i using cpu_producer_arr[i]->produce(host_mem)
-    // Each threadblock gets requests using gpu_consumer_arr[blockIdx.x]->consume(device_mem)
-    // Response sent using opposite queues (producer <-> consumer)
+        if (can_send_tasks( &(pc_queue[i_next_consumer]) )) { // send new tasks
+            int req_num = NREQUESTS - left_requests;
+            int img_idx = (req_num % N_IMG_PAIRS) * IMG_DIMENSION * IMG_DIMENSION;
+            // send task!
+            // printf("sending task: %d to %d. image index is: %d\n", req_num, i_next_consumer, img_idx);
+            send_task(req_num, img_idx, &(pc_queue[i_next_consumer]), time);
+            --left_requests;
+        }
+        i_next_consumer = (i_next_consumer + 1) % nConsumers; // move to next consumer
+    }
 
+    SYNCED_WRITE(*done = 1); // we can tell all consumers that there are no more tasks left
+
+    // collect remaining results
+    for (int i = 0 ; i < nConsumers; i++) {
+        do {
+            total_distance += collect_completed_tasks_results(&(cp_queue[i]), time);
+        } while(cp_queue[i].i_consumer < pc_queue[i].i_producer);
+        total_distance += collect_completed_tasks_results(&(cp_queue[i]), time);
+    }
+
+    // free!!!
+    CUDA_CHECK( cudaFreeHost((void*)done) ); 
+    CUDA_CHECK( cudaFreeHost((void*)pc_queue) );
+    CUDA_CHECK( cudaFreeHost((void*)cp_queue) );
+    CUDA_CHECK( cudaFree(gpu_image1) );
+    CUDA_CHECK( cudaFree(gpu_image2) );
+
+    return total_distance;
 }
 
 int main(int argc, char *argv[]) {
-
+    double total_distance = 0;
     struct cmd_line_args args = read_cmd_params(argc, argv);
 
     uchar *images1; /* we concatenate all images in one huge array */
@@ -536,73 +719,39 @@ int main(int argc, char *argv[]) {
     CUDA_CHECK( cudaHostAlloc(&images2, N_IMG_PAIRS * IMG_DIMENSION * IMG_DIMENSION, 0) );
     load_image_pairs(images1, images2);
 
-    struct times time {0, 0};
+    struct times time = {0, 0};
     double t_start = 0, t_finish = 0;
 
     /* using CPU */
     printf("\n=== CPU ===\n");
-    double total_distance = h_calc_distance(images1, images2, &time);
+    total_distance = h_calc_distance(images1, images2, &time);
     printf("average distance between images %f\n", total_distance / NREQUESTS);
     printf("throughput = %lf (req/sec)\n", NREQUESTS / (time.t_finish - time.t_start) * 1e+3);
 
 
     /* using GPU task-serial.. just to verify the GPU code makes sense */
-    // printf("\n=== GPU Task Serial ===\n");
-    // do {
-    //     double total_distance = d_calc_distance(images1, images2, &time);
-    //     printf("average distance between images %f\n", total_distance / NREQUESTS);
-    //     printf("throughput = %lf (req/sec)\n", NREQUESTS / (t_finish - t_start) * 1e+3);
-    // } while (0);
+    printf("\n=== GPU Task Serial ===\n");
+    do {
+        double total_distance = d_calc_distance(images1, images2, &time);
+        printf("average distance between images %f\n", total_distance / NREQUESTS);
+        printf("throughput = %lf (req/sec)\n", NREQUESTS / (t_finish - t_start) * 1e+3);
+    } while (0);
 
     /* now for the client-server part */
     printf("\n=== Client-Server ===\n");
     total_distance = 0;
     struct times *vtimes = (struct times *) malloc(NREQUESTS * sizeof(struct times));
-    // double *req_t_start = (double *) malloc(NREQUESTS * sizeof(double));
     memset(vtimes, 0, NREQUESTS * sizeof(struct times));
-
-    // double *req_t_end = (double *) malloc(NREQUESTS * sizeof(double));
-    // memset(req_t_end, 0, NREQUESTS * sizeof(double));
-
-    // struct rate_limit_t rate_limit;
-    // rate_limit_init(&rate_limit, args.load, 0);
-
-    /* TODO allocate / initialize memory, streams, etc... */
 
     double ti = get_time_msec();
     if (args.mode == PROGRAM_MODE_STREAMS) {
+
         total_distance = stream_calc_distance(images1, images2, args.load, vtimes);
-        // for (int i = 0; i < NREQUESTS; i++) {
 
-        //     /* TODO query (don't block) streams for any completed requests.
-        //        update req_t_end of completed requests
-        //        update total_distance */
-
-        //     rate_limit_wait(&rate_limit);
-        //     req_t_start[i] = get_time_msec();
-        //     int img_idx = i % N_IMG_PAIRS;
-
-        //     /* TODO place memcpy's and kernels in a stream */
-        // }
-        /* TODO now make sure to wait for all streams to finish */
     } else if (args.mode == PROGRAM_MODE_QUEUE) {
-        int max_threadblocks = get_max_threadblocks(args.threads_queue_mode); 
-        
-
-        // for (int i = 0; i < NREQUESTS; i++) {
-
-        //     /* TODO check producer consumer queue for any responses.
-        //        don't block. if no responses are there we'll check again in the next iteration
-        //        update req_t_end of completed requests 
-        //        update total_distance */
-
-        //     rate_limit_wait(&rate_limit);
-        //     int img_idx = i % N_IMG_PAIRS;
-        //     req_t_start[i] = get_time_msec();
-
-            /* TODO place memcpy's and kernels in a stream */
-        // }
-        /* TODO wait until you have responses for all requests */
+        int max_threadblocks = get_max_threadblocks(args.threads_queue_mode);
+        // printf("max threadblocks: %d\n", max_threadblocks); 
+        total_distance = producer_consumer_calc_distance(images1, images2, args.load, vtimes, max_threadblocks, args.threads_queue_mode);
     } else {
         assert(0);
     }
@@ -611,6 +760,7 @@ int main(int argc, char *argv[]) {
     double avg_latency = 0;
     for (int i = 0; i < NREQUESTS; i++) {
         avg_latency += (vtimes[i].t_finish - vtimes[i].t_start);
+        // printf("%lf %lf\n", vtimes[i].t_start,vtimes[i].t_finish);
     }
     avg_latency /= NREQUESTS;
 
@@ -621,6 +771,9 @@ int main(int argc, char *argv[]) {
     printf("throughput = %lf (req/sec)\n", NREQUESTS / (tf - ti) * 1e+3);
     printf("average latency = %lf (msec)\n", avg_latency);
 
-    // FREE CUDAHOSTALLOC MEMORY @@@@@@@@@!!!!!!!!!!@@@@@@@@@@@ TODO TODO TODO !!!
+    free(vtimes);
+    CUDA_CHECK( cudaFreeHost(images1) );
+    CUDA_CHECK( cudaFreeHost(images2) );
+
     return 0;
 }
